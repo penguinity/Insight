@@ -1,0 +1,16 @@
+# Databases & Local Logs
+data/*.db
+*.log
+
+# Secrets & Local Configurations
+.env
+__pycache__/
+.vscode/
+
+# Personal Project PDFs/.txt files
+/SQLite Database Schema Draft.pdf
+/CMS API.txt
+
+# Local Big Data Assets (Forbidden from tracking due to file size limits)
+data/cms_source.zip
+data/cms_outliers.db
