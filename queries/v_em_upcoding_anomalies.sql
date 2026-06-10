@@ -1,4 +1,6 @@
-CREATE VIEW IF NOT EXISTS v_em_upcoding_anomalies AS
+DROP VIEW IF EXISTS v_em_upcoding_anomalies;
+
+CREATE VIEW v_em_upcoding_anomalies AS
 WITH provider_em_distributions AS (
     -- Aggregate total Evaluation and Management service volume and isolate the Level 5 tier
     SELECT 
@@ -11,22 +13,36 @@ WITH provider_em_distributions AS (
         Hcpcs_Cd IN ('99211', '99212', '99213', '99214', '99215')
     GROUP BY 
         Rndrg_Npi
+),
+scored_rows AS (
+    SELECT 
+        d.Rndrg_Npi,
+        p.Rndrg_Prvdr_Last_Org_Name,
+        p.Rndrg_Prvdr_First_Name,
+        p.Rndrg_Prvdr_Type,
+        d.volume_level_5,
+        d.total_em_volume,
+        -- Determine the percentage share of high-complexity code selections
+        ROUND((d.volume_level_5 / NULLIF(d.total_em_volume, 0)) * 100, 2) AS level_5_utilization_share,
+        -- Risk Flag Vector 3 Condition: Level 5 share exceeds 50% with an audit-viable sample size
+        CASE 
+            WHEN d.total_em_volume >= 50 AND (d.volume_level_5 / NULLIF(d.total_em_volume, 0)) > 0.50 THEN 30
+            ELSE 0
+        END AS upcoding_risk_points
+    FROM 
+        provider_em_distributions d
+    JOIN 
+        dim_providers p ON d.Rndrg_Npi = p.Rndrg_Npi
+    WHERE d.total_em_volume > 0
 )
-SELECT 
-    d.Rndrg_Npi,
-    p.Rndrg_Prvdr_Last_Org_Name,
-    p.Rndrg_Prvdr_First_Name,
-    p.Rndrg_Prvdr_Type,
-    d.volume_level_5,
-    d.total_em_volume,
-    -- Determine the percentage share of high-complexity code selections
-    ROUND((d.volume_level_5 / d.total_em_volume) * 100, 2) AS level_5_utilization_share,
-    -- Risk Flag Vector 3 Condition: Level 5 share exceeds 50% with an audit-viable sample size
-    CASE 
-        WHEN d.total_em_volume >= 50 AND (d.volume_level_5 / d.total_em_volume) > 0.50 THEN 30
-        ELSE 0
-    END AS upcoding_risk_points
-FROM 
-    provider_em_distributions d
-JOIN 
-    dim_providers p ON d.Rndrg_Npi = p.Rndrg_Npi;
+SELECT
+    Rndrg_Npi,
+    Rndrg_Prvdr_Last_Org_Name,
+    Rndrg_Prvdr_First_Name,
+    Rndrg_Prvdr_Type,
+    volume_level_5,
+    total_em_volume,
+    level_5_utilization_share,
+    upcoding_risk_points
+FROM scored_rows
+WHERE upcoding_risk_points > 0;

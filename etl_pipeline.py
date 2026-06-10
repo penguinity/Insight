@@ -23,6 +23,8 @@ from typing import Any, Generator
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from schema_router import get_source_value, read_sql_file
+
 CATALOG_URL = "https://data.cms.gov/data.json"
 TARGET_DATASET_TITLE = (
     "Medicare Physician & Other Practitioners - by Provider and Service"
@@ -173,7 +175,7 @@ def download_archive(download_url: str, dest_path: Path) -> None:
     )
 
 
-def iter_csv_rows(file_path: Path) -> Generator[dict[str, str], None, None]:
+def iter_csv_rows(file_path: Path) -> Generator[dict[str, object], None, None]:
     """
     Yield one CSV row dict at a time, adaptively handling both compressed ZIP
     archives and raw Comma-Separated Values (CSV) text files dynamically.
@@ -220,8 +222,7 @@ def open_database(db_path: Path) -> sqlite3.Connection:
 def initialize_schema(connection: sqlite3.Connection, ddl_path: Path) -> None:
     """Initialize the database schema from the canonical SQL DDL file."""
 
-    with ddl_path.open("r", encoding="utf-8") as ddl_file:
-        connection.executescript(ddl_file.read())
+    connection.executescript(read_sql_file(ddl_path))
 
 
 
@@ -265,30 +266,30 @@ def normalize_row(record: dict[str, Any]) -> tuple[tuple[Any, ...], ...]:
     """Split one CMS source row into matching lookup dimension and metric fact tuple rows."""
 
     provider_row = (
-        clean_text(record.get("rndrng_npi")),
-        clean_text(record.get("rndrng_prvdr_last_org_name")),
-        clean_text(record.get("rndrng_prvdr_first_name")),
-        clean_text(record.get("rndrng_prvdr_crdntls")),
-        clean_text(record.get("rndrng_prvdr_type")),
+        clean_text(get_source_value(record, "rndrng_npi")),
+        clean_text(get_source_value(record, "rndrng_prvdr_last_org_name")),
+        clean_text(get_source_value(record, "rndrng_prvdr_first_name")),
+        clean_text(get_source_value(record, "rndrng_prvdr_crdntls")),
+        clean_text(get_source_value(record, "rndrng_prvdr_type")),
     )
     procedure_row = (
         clean_text(record.get("hcpcs_cd")),
         clean_text(record.get("hcpcs_desc")),
     )
     geography_row = (
-        clean_text(record.get("rndrng_prvdr_zip5")),
-        clean_text(record.get("rndrng_prvdr_state_abrvtn")),
+        clean_text(get_source_value(record, "rndrng_prvdr_zip5")),
+        clean_text(get_source_value(record, "rndrng_prvdr_state_abrvtn")),
     )
     fact_row = (
-        clean_text(record.get("rndrng_npi")),
+        clean_text(get_source_value(record, "rndrng_npi")),
         clean_text(record.get("hcpcs_cd")),
-        clean_text(record.get("rndrng_prvdr_zip5")),
+        clean_text(get_source_value(record, "rndrng_prvdr_zip5")),
         clean_text(record.get("place_of_srvc")),
         clean_int(record.get("tot_benes")),
         clean_decimal(record.get("tot_srvcs")),
-        clean_decimal(record.get("avg_sbmtd_chrg")),
-        clean_decimal(record.get("avg_mdcr_alowd_amt")),
-        clean_decimal(record.get("avg_mdcr_pymt_amt")),
+        clean_decimal(get_source_value(record, "avg_sbmtd_chrg")),
+        clean_decimal(get_source_value(record, "avg_mdcr_alowd_amt")),
+        clean_decimal(get_source_value(record, "avg_mdcr_pymt_amt")),
     )
 
     return provider_row, procedure_row, geography_row, fact_row
@@ -367,7 +368,9 @@ def run_etl() -> None:
 
                 # In-flight state filter — skip every non-NC row immediately
                 # to keep the memory footprint near zero for the national file.
-                if clean_text(record.get("rndrng_prvdr_state_abrvtn")) != STATE_FILTER:
+                if clean_text(
+                    get_source_value(record, "rndrng_prvdr_state_abrvtn")
+                ) != STATE_FILTER:
                     continue
 
                 total_extracted += 1
