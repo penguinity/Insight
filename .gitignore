@@ -1,5 +1,6 @@
 # Databases & Local Logs
 data/*.db
+data/cms_outliers.db
 *.log
 
 # Secrets & Local Configurations
@@ -7,11 +8,12 @@ data/*.db
 __pycache__/
 .vscode/
 
-# Personal Project PDFs/.txt files
-/SQLite Database Schema Draft.pdf
-/CMS API.txt
-/reference
+# Local Testing Playground
+quick test.py
+quick_test.py
+
+# Personal Reference Materials & Folder Drafts
+reference/
 
 # Local Big Data Assets (Forbidden from tracking due to file size limits)
 data/cms_source.zip
-data/cms_outliers.db
