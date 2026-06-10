@@ -10,6 +10,7 @@ __pycache__/
 # Personal Project PDFs/.txt files
 /SQLite Database Schema Draft.pdf
 /CMS API.txt
+/reference
 
 # Local Big Data Assets (Forbidden from tracking due to file size limits)
 data/cms_source.zip
