@@ -4,8 +4,10 @@
 This pipeline dynamically discovers and downloads the full CMS national bulk
 archive from the federal metadata catalog, streams the enclosed CSV through
 Python's zipfile and csv.DictReader without loading it into memory, filters
-rows to North Carolina in-flight, and batch-loads every 10,000 qualifying
-records into a normalized SQLite star schema inside a single master transaction.
+rows to the configured STATE_FILTER in-flight, and batch-loads every 10,000
+qualifying records into a state-isolated SQLite star schema inside a single
+master transaction. Each state writes to its own database file so no prior
+state's data is ever overwritten.
 """
 
 from __future__ import annotations
@@ -29,12 +31,14 @@ CATALOG_URL = "https://data.cms.gov/data.json"
 TARGET_DATASET_TITLE = (
     "Medicare Physician & Other Practitioners - by Provider and Service"
 )
-STATE_FILTER = "NC"
-BATCH_SIZE = 10_000          # Number of qualifying NC rows buffered before each executemany flush
+STATE_FILTER = "AL"          # Change to any two-letter state abbreviation (e.g. "AL", "TX", "FL")
+BATCH_SIZE = 10_000          # Number of qualifying rows buffered before each executemany flush
 DOWNLOAD_CHUNK_BYTES = 1_048_576  # 1 MB streaming blocks for the archive download
 REQUEST_TIMEOUT_SECONDS = 120
-DB_PATH = Path("data/cms_outliers.db")
-ZIP_PATH = Path("data/cms_source.zip")
+# DB_PATH is derived from STATE_FILTER so each state gets its own isolated database.
+# Changing STATE_FILTER never overwrites a previously built state's database.
+DB_PATH = Path(f"data/cms_outliers_{STATE_FILTER.lower()}.db")
+ZIP_PATH = Path("data/cms_source.zip")   # National archive — shared across all state runs
 DDL_PATH = Path("queries/ddl_schema.sql")
 USER_AGENT = "CMS-PartB-Provider-Compliance-ETL/1.0"
 
@@ -225,6 +229,43 @@ def initialize_schema(connection: sqlite3.Connection, ddl_path: Path) -> None:
     connection.executescript(read_sql_file(ddl_path))
 
 
+def _guard_state(connection: sqlite3.Connection, state: str, db_path: Path) -> None:
+    """Verify this database was built for *state*; abort if it was built for another.
+
+    A lightweight ``etl_metadata`` table stores the state tag on first use.  Any
+    subsequent run that presents a different STATE_FILTER raises immediately so
+    data is never silently mixed or overwritten across state boundaries.
+    """
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS etl_metadata (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    connection.commit()
+
+    row = connection.execute(
+        "SELECT value FROM etl_metadata WHERE key = 'state_filter'"
+    ).fetchone()
+
+    if row is None:
+        connection.execute(
+            "INSERT INTO etl_metadata (key, value) VALUES ('state_filter', ?)",
+            (state,),
+        )
+        connection.commit()
+    elif row[0] != state:
+        raise RuntimeError(
+            f"Database '{db_path}' was built for state '{row[0]}' but "
+            f"STATE_FILTER is currently '{state}'. "
+            f"To reload this state set STATE_FILTER = '{row[0]}'; "
+            f"for a fresh '{state}' database confirm DB_PATH points to a new file."
+        )
+
+
 
 def clean_text(value: Any) -> str | None:
     """Normalize CMS string fields and preserve NULLs for missing values."""
@@ -339,14 +380,24 @@ def run_etl() -> None:
     # ------------------------------------------------------------------ #
     # Layer 3 – Open database, initialize schema, and wipe fact table    #
     # ------------------------------------------------------------------ #
+    logger.info(
+        "ETL target — state: %s | database: %s",
+        STATE_FILTER,
+        DB_PATH.resolve(),
+    )
+
     connection = open_database(DB_PATH)
     try:
         initialize_schema(connection, DDL_PATH)
+        _guard_state(connection, STATE_FILTER, DB_PATH)
 
         # Wipe previous fact rows so reruns stay idempotent. Dimension tables
         # retain their INSERT OR IGNORE protection and are not truncated.
         connection.execute("DELETE FROM fact_provider_services;")
-        logger.info("Cleared previous fact records to prevent data duplication anomalies.")
+        logger.info(
+            "Cleared previous %s fact records to prevent data duplication anomalies.",
+            STATE_FILTER,
+        )
 
         # ------------------------------------------------------------------ #
         # Layer 4 + 5 – Stream CSV rows, filter, buffer, and batch-insert    #
@@ -366,8 +417,8 @@ def run_etl() -> None:
             for record in iter_csv_rows(ZIP_PATH):
                 total_scanned += 1
 
-                # In-flight state filter — skip every non-NC row immediately
-                # to keep the memory footprint near zero for the national file.
+                # In-flight state filter — skip every non-STATE_FILTER row
+                # immediately to keep memory footprint near zero for the national file.
                 if clean_text(
                     get_source_value(record, "rndrng_prvdr_state_abrvtn")
                 ) != STATE_FILTER:
@@ -389,7 +440,7 @@ def run_etl() -> None:
                 geography_buf.append(geography_row)
                 fact_buf.append(fact_row)
 
-                # Flush every BATCH_SIZE qualifying NC rows to keep buffer RAM bounded.
+                # Flush every BATCH_SIZE qualifying rows to keep buffer RAM bounded.
                 if len(fact_buf) >= BATCH_SIZE:
                     flushed = flush_buffers(
                         connection, provider_buf, procedure_buf, geography_buf, fact_buf

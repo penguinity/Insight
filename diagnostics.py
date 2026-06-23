@@ -8,13 +8,82 @@ Run from the project root:
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path("data/cms_outliers.db")
-
+from etl_pipeline import DB_PATH
 from schema_router import find_rogue_database_objects, reconcile_database_objects
+
+
+def build_db_path_for_state(state: str) -> Path:
+    """Return the conventional state-scoped database path for diagnostics."""
+
+    normalized = state.strip().upper()
+    if len(normalized) != 2 or not normalized.isalpha():
+        raise ValueError("State must be a two-letter abbreviation like AL or NC")
+    return Path(f"data/cms_outliers_{normalized.lower()}.db")
+
+
+def discover_state_databases(data_dir: Path = Path("data")) -> dict[str, Path]:
+    """Discover created state databases keyed by two-letter state abbreviation."""
+
+    discovered: dict[str, Path] = {}
+    for db_file in data_dir.glob("cms_outliers_*.db"):
+        state_code = db_file.stem.removeprefix("cms_outliers_").upper()
+        if len(state_code) == 2 and state_code.isalpha():
+            discovered[state_code] = db_file
+    return dict(sorted(discovered.items()))
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse CLI flags that select which SQLite database to diagnose."""
+
+    parser = argparse.ArgumentParser(
+        description="Run integrity diagnostics against a CMS SQLite database."
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        help="Explicit path to a SQLite file (overrides default state target).",
+    )
+    parser.add_argument(
+        "--state",
+        type=str,
+        help="Two-letter state abbreviation (e.g., AL, NC).",
+    )
+    return parser.parse_args()
+
+
+def resolve_target_db_path(args: argparse.Namespace) -> tuple[Path, str]:
+    """Resolve target database path from CLI args with clear precedence rules."""
+
+    if args.db and args.state:
+        raise ValueError("Use either --db or --state, not both in the same run")
+
+    if args.db:
+        return args.db, "custom"
+
+    if args.state:
+        normalized_state = args.state.strip().upper()
+        return build_db_path_for_state(normalized_state), normalized_state
+
+    state_dbs = discover_state_databases()
+    if len(state_dbs) == 1:
+        only_state, only_path = next(iter(state_dbs.items()))
+        return only_path, only_state
+
+    if len(state_dbs) > 1:
+        available = ", ".join(state_dbs.keys())
+        raise ValueError(
+            "Multiple state databases detected. "
+            "Specify --state <XX> or --db <path>. "
+            f"Available states: {available}"
+        )
+
+    return DB_PATH, "legacy-default"
+
 
 def configure_logging() -> None:
     logging.basicConfig(
@@ -26,8 +95,18 @@ def configure_logging() -> None:
 def run_diagnostics(db_path: Path = DB_PATH) -> None:
     logger = logging.getLogger("cms_diagnostics")
 
+    logger.info("Diagnostics target database: %s", db_path.resolve())
+
     if not db_path.exists():
-        logger.error("Database file not found: %s", db_path)
+        available = discover_state_databases()
+        if available:
+            logger.error(
+                "Database file not found: %s | Available state databases: %s",
+                db_path,
+                ", ".join(available.keys()),
+            )
+        else:
+            logger.error("Database file not found: %s", db_path)
         return
 
     conn = sqlite3.connect(db_path)
@@ -168,7 +247,8 @@ def run_diagnostics(db_path: Path = DB_PATH) -> None:
         if bm_count == 0:
             logger.warning(
                 "  dim_benchmarks is EMPTY. "
-                "Run: sqlite3 data/cms_outliers.db < queries/populate_dim_benchmarks.sql"
+                "Run: sqlite3 %s < queries/populate_dim_benchmarks.sql",
+                db_path,
             )
         else:
             logger.info(
@@ -185,4 +265,14 @@ def run_diagnostics(db_path: Path = DB_PATH) -> None:
 
 if __name__ == "__main__":
     configure_logging()
-    run_diagnostics()
+    cli_args = parse_args()
+    try:
+        target_db_path, target_label = resolve_target_db_path(cli_args)
+    except ValueError as exc:
+        logging.getLogger("cms_diagnostics").error("%s", exc)
+        raise SystemExit(2) from exc
+
+    logging.getLogger("cms_diagnostics").info(
+        "Running diagnostics for target: %s", target_label
+    )
+    run_diagnostics(target_db_path)

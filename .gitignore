@@ -17,3 +17,4 @@ reference/
 
 # Local Big Data Assets (Forbidden from tracking due to file size limits)
 data/cms_source.zip
+data/
