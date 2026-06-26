@@ -27,13 +27,13 @@ def build_db_path_for_state(state: str) -> Path:
 
 
 def discover_state_databases(data_dir: Path = Path("data")) -> dict[str, Path]:
-    """Discover created state databases keyed by two-letter state abbreviation."""
+    """Discover created state databases keyed by state-set suffix."""
 
     discovered: dict[str, Path] = {}
     for db_file in data_dir.glob("cms_outliers_*.db"):
-        state_code = db_file.stem.removeprefix("cms_outliers_").upper()
-        if len(state_code) == 2 and state_code.isalpha():
-            discovered[state_code] = db_file
+        state_key = db_file.stem.removeprefix("cms_outliers_").upper()
+        if state_key and all(part.isalpha() and len(part) == 2 for part in state_key.split("_")):
+            discovered[state_key] = db_file
     return dict(sorted(discovered.items()))
 
 

@@ -34,7 +34,7 @@ reports/                  # Generated PDF audit memos (gitignored)
 ### 1. Install dependencies
 
 ```bash
-pip install requests python-dotenv fpdf2
+pip install requests python-dotenv fpdf2 pyspark
 ```
 
 ### 2. Configure environment
@@ -51,20 +51,33 @@ OPENROUTER_API_KEY=sk-or-...
 python etl_pipeline.py
 ```
 
+Single-state explicit run:
+
+```bash
+python etl_pipeline.py --states "FL"
+```
+
+Dual-state run in one database:
+
+```bash
+python etl_pipeline.py --states "FL, GA"
+```
+
 The pipeline will:
 - Fetch `data.cms.gov/data.json` to locate the latest bulk archive URL
 - Stream the archive to `data/cms_source.zip` in 1 MB blocks
-- Parse the enclosed CSV row-by-row with zero memory accumulation
-- Filter rows to designated state (currently: `Rndrng_Prvdr_State_Abrvtn = "NC"`)
-- Batch-insert every 10,000 qualifying rows into the SQLite star schema within a single master transaction
+- Use PySpark to clean and standardize CMS columns in batch
+- Filter rows to one or two states from `--states` (supports `STATE` or `STATE, STATE`)
+- Batch-insert every 10,000 qualifying rows into the SQLite star schema
+- Build `dim_benchmarks` directly with PySpark aggregations for the selected state set
+
+Database naming:
+- `--states "FL"` writes to `data/cms_outliers_fl.db`
+- `--states "FL, GA"` writes to `data/cms_outliers_fl_ga.db`
 
 ### 4. Populate the benchmark table
 
-```bash
-sqlite3 data/cms_outliers.db < queries/populate_dim_benchmarks.sql
-```
-
-IMPORTANT: This step **must be run after every ETL reload**. The billing elasticity view depends on `dim_benchmarks` being current.
+PySpark now rebuilds `dim_benchmarks` inside `etl_pipeline.py`, so no separate SQL benchmark refresh is required for normal ETL runs.
 
 ### 5. Run diagnostics
 
@@ -132,15 +145,12 @@ To perform a full wipe-and-reload:
 
 ```bash
 # 1. Re-run ETL (clears fact table automatically before reload)
-python etl_pipeline.py
+python etl_pipeline.py --states "FL, GA"
 
-# 2. Refresh benchmark table
-sqlite3 data/cms_outliers.db < queries/populate_dim_benchmarks.sql
-
-# 3. Validate
+# 2. Validate
 python diagnostics.py
 
-# 4. Generate reports
+# 3. Generate reports
 python pdf_report.py
 ```
 

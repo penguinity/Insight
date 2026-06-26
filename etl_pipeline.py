@@ -2,45 +2,97 @@
 
 """
 This pipeline dynamically discovers and downloads the full CMS national bulk
-archive from the federal metadata catalog, streams the enclosed CSV through
-Python's zipfile and csv.DictReader without loading it into memory, filters
-rows to the configured STATE_FILTER in-flight, and batch-loads every 10,000
-qualifying records into a state-isolated SQLite star schema inside a single
-master transaction. Each state writes to its own database file so no prior
-state's data is ever overwritten.
+archive from the federal metadata catalog, extracts the enclosed CSV when
+needed, standardizes source columns with PySpark, filters rows to one or two
+configured states, and loads normalized rows into a SQLite star schema. The
+pipeline also rebuilds peer benchmarks with PySpark so multi-state analytics
+remain consistent with the selected ingestion scope.
 """
 
 from __future__ import annotations
 
-import codecs
-import csv
-import io
+import argparse
+import importlib
 import json
 import logging
 import sqlite3
 import zipfile
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from schema_router import get_source_value, read_sql_file
+from schema_router import read_sql_file
 
 CATALOG_URL = "https://data.cms.gov/data.json"
 TARGET_DATASET_TITLE = (
     "Medicare Physician & Other Practitioners - by Provider and Service"
 )
-STATE_FILTER = "AL"          # Change to any two-letter state abbreviation (e.g. "AL", "TX", "FL")
-BATCH_SIZE = 10_000          # Number of qualifying rows buffered before each executemany flush
-DOWNLOAD_CHUNK_BYTES = 1_048_576  # 1 MB streaming blocks for the archive download
+STATE_FILTER = "FL, GA"  # Supports one or two states: "FL" or "FL, GA"
+BATCH_SIZE = 10_000
+DOWNLOAD_CHUNK_BYTES = 1_048_576
 REQUEST_TIMEOUT_SECONDS = 120
-# DB_PATH is derived from STATE_FILTER so each state gets its own isolated database.
-# Changing STATE_FILTER never overwrites a previously built state's database.
-DB_PATH = Path(f"data/cms_outliers_{STATE_FILTER.lower()}.db")
-ZIP_PATH = Path("data/cms_source.zip")   # National archive — shared across all state runs
+ZIP_PATH = Path("data/cms_source.zip")
+EXTRACTED_CSV_PATH = Path("data/cms_source_extracted.csv")
 DDL_PATH = Path("queries/ddl_schema.sql")
-USER_AGENT = "CMS-PartB-Provider-Compliance-ETL/1.0"
+USER_AGENT = "CMS-PartB-Provider-Compliance-ETL/2.0"
+
+
+def parse_states(raw_states: str) -> tuple[str, ...]:
+    """Parse one or two comma-delimited state codes into normalized uppercase values."""
+
+    cleaned = [part.strip().upper() for part in raw_states.split(",") if part.strip()]
+    if not cleaned:
+        raise ValueError("Provide at least one state, e.g. 'FL' or 'FL, GA'")
+
+    unique_states: list[str] = []
+    for state in cleaned:
+        if len(state) != 2 or not state.isalpha():
+            raise ValueError(f"Invalid state code: {state}")
+        if state not in unique_states:
+            unique_states.append(state)
+
+    if len(unique_states) > 2:
+        raise ValueError(
+            "This ETL revision supports one or two states per run. "
+            "Example: --states 'FL, GA'"
+        )
+    return tuple(unique_states)
+
+
+def derive_db_path(states: Iterable[str]) -> Path:
+    """Build a deterministic state-scoped database path for one or two states."""
+
+    normalized = [state.lower() for state in states]
+    return Path(f"data/cms_outliers_{'_'.join(normalized)}.db")
+
+
+DEFAULT_STATES = parse_states(STATE_FILTER)
+DB_PATH = derive_db_path(DEFAULT_STATES)
+
+
+def _require_pyspark() -> tuple[Any, Any]:
+    """Import and return SparkSession plus pyspark.sql.functions lazily."""
+
+    try:
+        spark_sql = importlib.import_module("pyspark.sql")
+        spark_functions = importlib.import_module("pyspark.sql.functions")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "PySpark is required for this ETL mode. Install with: pip install pyspark"
+        ) from exc
+    return spark_sql.SparkSession, spark_functions
+
+
+def _resolve_column_name(df: Any, candidates: tuple[str, ...]) -> str | None:
+    """Resolve a source column without depending on exact header casing."""
+
+    normalized_columns = {column.lower(): column for column in df.columns}
+    for candidate in candidates:
+        resolved = normalized_columns.get(candidate.lower())
+        if resolved is not None:
+            return resolved
+    return None
 
 PROVIDER_INSERT_SQL = """
     INSERT OR IGNORE INTO dim_providers (
@@ -78,6 +130,18 @@ FACT_INSERT_SQL = """
         Avg_Medcr_Alwd_Amt,
         Avg_Medcr_Pymt_Amt
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+BENCHMARK_INSERT_SQL = """
+    INSERT INTO dim_benchmarks (
+        Rndrg_Prvdr_Type,
+        Hcpcs_Cd,
+        Peer_Avg_Submitted_Charge,
+        Peer_Avg_Allowed_Amt,
+        Peer_Avg_Payment_Amt,
+        Peer_Avg_Markup_Ratio,
+        Peer_Row_Count
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -179,36 +243,30 @@ def download_archive(download_url: str, dest_path: Path) -> None:
     )
 
 
-def iter_csv_rows(file_path: Path) -> Generator[dict[str, object], None, None]:
-    """
-    Yield one CSV row dict at a time, adaptively handling both compressed ZIP
-    archives and raw Comma-Separated Values (CSV) text files dynamically.
-    """
+def resolve_csv_source(file_path: Path, extracted_csv_path: Path) -> Path:
+    """Return a local CSV path, extracting from ZIP once when needed."""
 
-    # Pathway A: The file is genuinely a compressed ZIP archive
-    if zipfile.is_zipfile(file_path):
-        with zipfile.ZipFile(file_path, "r") as archive:
-            csv_members = [
-                name for name in archive.namelist()
-                if name.lower().endswith(".csv")
-            ]
-            if not csv_members:
-                raise RuntimeError(f"No CSV file found inside archive: {file_path}")
+    if not zipfile.is_zipfile(file_path):
+        return file_path
 
-            csv_member = csv_members[0]
-            with archive.open(csv_member) as raw_stream:
-                text_stream = codecs.getreader("utf-8-sig")(raw_stream)
-                reader = csv.DictReader(text_stream)
-                for row in reader:
-                    yield {str(k).lower(): v for k, v in row.items()}
+    extracted_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    if extracted_csv_path.exists() and extracted_csv_path.stat().st_mtime >= file_path.stat().st_mtime:
+        return extracted_csv_path
 
-    # Pathway B: The federal server handed us the uncompressed CSV directly
-    else:
-        # Open the massive text file dynamically using a zero-memory generator
-        with file_path.open("r", encoding="utf-8-sig") as text_stream:
-            reader = csv.DictReader(text_stream)
-            for row in reader:
-                yield {str(k).lower(): v for k, v in row.items()}
+    with zipfile.ZipFile(file_path, "r") as archive:
+        csv_members = [name for name in archive.namelist() if name.lower().endswith(".csv")]
+        if not csv_members:
+            raise RuntimeError(f"No CSV file found inside archive: {file_path}")
+
+        member = csv_members[0]
+        with archive.open(member) as source, extracted_csv_path.open("wb") as target:
+            while True:
+                chunk = source.read(DOWNLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                target.write(chunk)
+
+    return extracted_csv_path
 
 
 def open_database(db_path: Path) -> sqlite3.Connection:
@@ -229,13 +287,8 @@ def initialize_schema(connection: sqlite3.Connection, ddl_path: Path) -> None:
     connection.executescript(read_sql_file(ddl_path))
 
 
-def _guard_state(connection: sqlite3.Connection, state: str, db_path: Path) -> None:
-    """Verify this database was built for *state*; abort if it was built for another.
-
-    A lightweight ``etl_metadata`` table stores the state tag on first use.  Any
-    subsequent run that presents a different STATE_FILTER raises immediately so
-    data is never silently mixed or overwritten across state boundaries.
-    """
+def _guard_states(connection: sqlite3.Connection, states: tuple[str, ...], db_path: Path) -> None:
+    """Verify database metadata matches the configured one- or two-state target."""
 
     connection.execute(
         """
@@ -248,121 +301,289 @@ def _guard_state(connection: sqlite3.Connection, state: str, db_path: Path) -> N
     connection.commit()
 
     row = connection.execute(
-        "SELECT value FROM etl_metadata WHERE key = 'state_filter'"
+        "SELECT value FROM etl_metadata WHERE key = 'state_filters'"
     ).fetchone()
+
+    encoded = ",".join(states)
 
     if row is None:
         connection.execute(
-            "INSERT INTO etl_metadata (key, value) VALUES ('state_filter', ?)",
-            (state,),
+            "INSERT INTO etl_metadata (key, value) VALUES ('state_filters', ?)",
+            (encoded,),
         )
+        connection.execute("DELETE FROM etl_metadata WHERE key = 'state_filter'")
         connection.commit()
-    elif row[0] != state:
+    elif row[0] != encoded:
         raise RuntimeError(
-            f"Database '{db_path}' was built for state '{row[0]}' but "
-            f"STATE_FILTER is currently '{state}'. "
-            f"To reload this state set STATE_FILTER = '{row[0]}'; "
-            f"for a fresh '{state}' database confirm DB_PATH points to a new file."
+            f"Database '{db_path}' was built for state set '{row[0]}' but "
+            f"states are currently '{encoded}'. "
+            "Point to a new DB path or re-run with the original state set."
         )
 
 
-
-def clean_text(value: Any) -> str | None:
-    """Normalize CMS string fields and preserve NULLs for missing values."""
-
-    if value is None:
-        return None
-
-    text_value = str(value).strip()
-    return text_value if text_value else None
+def _first_existing_col(df: Any, candidates: tuple[str, ...], spark_functions: Any) -> Any:
+    resolved_name = _resolve_column_name(df, candidates)
+    existing = [spark_functions.col(resolved_name)] if resolved_name is not None else []
+    if not existing:
+        return spark_functions.lit(None)
+    return spark_functions.coalesce(*existing)
 
 
-def clean_int(value: Any) -> int | None:
-    """Convert CMS integer-like values to Python ints before SQLite binding."""
-
-    text_value = clean_text(value)
-    if text_value is None:
-        return None
-
-    try:
-        return int(Decimal(text_value.replace(",", "")))
-    except (InvalidOperation, ValueError, TypeError):
-        return None
+def _clean_text_col(col: Any, spark_functions: Any) -> Any:
+    return spark_functions.when(
+        spark_functions.trim(col) == "",
+        spark_functions.lit(None),
+    ).otherwise(spark_functions.trim(col))
 
 
-def clean_decimal(value: Any) -> float | None:
-    """Convert CMS numeric strings to floats for SQLite NUMERIC affinity."""
-
-    text_value = clean_text(value)
-    if text_value is None:
-        return None
-
-    try:
-        return float(Decimal(text_value.replace(",", "")))
-    except (InvalidOperation, ValueError, TypeError):
-        return None
+def _clean_numeric_col(col: Any, spark_functions: Any, cast_type: str = "double") -> Any:
+    normalized = spark_functions.regexp_replace(spark_functions.trim(col), ",", "")
+    return spark_functions.when(
+        (spark_functions.trim(col) == "") | col.isNull(),
+        spark_functions.lit(None),
+    ).otherwise(normalized.cast(cast_type))
 
 
-def normalize_row(record: dict[str, Any]) -> tuple[tuple[Any, ...], ...]:
-    """Split one CMS source row into matching lookup dimension and metric fact tuple rows."""
+def build_standardized_frame(spark: Any, csv_path: Path, states: tuple[str, ...]) -> Any:
+    """Use PySpark to standardize CMS columns and filter to one or two target states."""
 
-    provider_row = (
-        clean_text(get_source_value(record, "rndrng_npi")),
-        clean_text(get_source_value(record, "rndrng_prvdr_last_org_name")),
-        clean_text(get_source_value(record, "rndrng_prvdr_first_name")),
-        clean_text(get_source_value(record, "rndrng_prvdr_crdntls")),
-        clean_text(get_source_value(record, "rndrng_prvdr_type")),
+    _, spark_functions = _require_pyspark()
+    raw_df = spark.read.option("header", True).option("inferSchema", False).csv(str(csv_path))
+
+    standardized = raw_df.select(
+        _clean_text_col(
+            _first_existing_col(raw_df, ("rndrng_npi", "rndrg_npi"), spark_functions),
+            spark_functions,
+        ).alias("rndrg_npi"),
+        _clean_text_col(
+            _first_existing_col(
+                raw_df,
+                ("rndrng_prvdr_last_org_name", "rndrg_prvdr_last_org_name"),
+                spark_functions,
+            ),
+            spark_functions,
+        ).alias("rndrg_prvdr_last_org_name"),
+        _clean_text_col(
+            _first_existing_col(
+                raw_df,
+                ("rndrng_prvdr_first_name", "rndrg_prvdr_first_name"),
+                spark_functions,
+            ),
+            spark_functions,
+        ).alias("rndrg_prvdr_first_name"),
+        _clean_text_col(
+            _first_existing_col(
+                raw_df,
+                ("rndrng_prvdr_crdntls", "rndrg_prvdr_crdntl", "rndrg_prvdr_crdntls"),
+                spark_functions,
+            ),
+            spark_functions,
+        ).alias("rndrg_prvdr_crdntl"),
+        _clean_text_col(
+            _first_existing_col(raw_df, ("rndrng_prvdr_type", "rndrg_prvdr_type"), spark_functions),
+            spark_functions,
+        ).alias("rndrg_prvdr_type"),
+        _clean_text_col(
+            _first_existing_col(raw_df, ("hcpcs_cd",), spark_functions),
+            spark_functions,
+        ).alias("hcpcs_cd"),
+        _clean_text_col(
+            _first_existing_col(raw_df, ("hcpcs_desc",), spark_functions),
+            spark_functions,
+        ).alias("hcpcs_desc"),
+        _clean_text_col(
+            _first_existing_col(raw_df, ("rndrng_prvdr_zip5", "rndrg_prvdr_zip5"), spark_functions),
+            spark_functions,
+        ).alias("rndrg_prvdr_zip5"),
+        spark_functions.upper(
+            _clean_text_col(
+                _first_existing_col(
+                    raw_df,
+                    ("rndrng_prvdr_state_abrvtn", "rndrg_prvdr_state_abrvtn"),
+                    spark_functions,
+                ),
+                spark_functions,
+            )
+        ).alias("rndrg_prvdr_state_abrvtn"),
+        _clean_text_col(
+            _first_existing_col(raw_df, ("place_of_srvc",), spark_functions),
+            spark_functions,
+        ).alias("place_of_srvc"),
+        _clean_numeric_col(
+            _first_existing_col(raw_df, ("tot_benes",), spark_functions),
+            spark_functions,
+            "int",
+        ).alias("tot_benes"),
+        _clean_numeric_col(
+            _first_existing_col(raw_df, ("tot_srvcs",), spark_functions),
+            spark_functions,
+            "double",
+        ).alias("tot_srvcs"),
+        _clean_numeric_col(
+            _first_existing_col(raw_df, ("avg_sbmtd_chrg", "avg_srvc_smtd_chrg"), spark_functions),
+            spark_functions,
+            "double",
+        ).alias("avg_srvc_smtd_chrg"),
+        _clean_numeric_col(
+            _first_existing_col(raw_df, ("avg_mdcr_alowd_amt", "avg_medcr_alwd_amt"), spark_functions),
+            spark_functions,
+            "double",
+        ).alias("avg_medcr_alwd_amt"),
+        _clean_numeric_col(
+            _first_existing_col(raw_df, ("avg_mdcr_pymt_amt", "avg_medcr_pymt_amt"), spark_functions),
+            spark_functions,
+            "double",
+        ).alias("avg_medcr_pymt_amt"),
     )
-    procedure_row = (
-        clean_text(record.get("hcpcs_cd")),
-        clean_text(record.get("hcpcs_desc")),
-    )
-    geography_row = (
-        clean_text(get_source_value(record, "rndrng_prvdr_zip5")),
-        clean_text(get_source_value(record, "rndrng_prvdr_state_abrvtn")),
-    )
-    fact_row = (
-        clean_text(get_source_value(record, "rndrng_npi")),
-        clean_text(record.get("hcpcs_cd")),
-        clean_text(get_source_value(record, "rndrng_prvdr_zip5")),
-        clean_text(record.get("place_of_srvc")),
-        clean_int(record.get("tot_benes")),
-        clean_decimal(record.get("tot_srvcs")),
-        clean_decimal(get_source_value(record, "avg_sbmtd_chrg")),
-        clean_decimal(get_source_value(record, "avg_mdcr_alowd_amt")),
-        clean_decimal(get_source_value(record, "avg_mdcr_pymt_amt")),
+
+    filtered = standardized.filter(spark_functions.col("rndrg_prvdr_state_abrvtn").isin(list(states)))
+
+    return filtered.filter(
+        spark_functions.col("rndrg_npi").isNotNull()
+        & spark_functions.col("hcpcs_cd").isNotNull()
+        & spark_functions.col("rndrg_prvdr_zip5").isNotNull()
     )
 
-    return provider_row, procedure_row, geography_row, fact_row
+
+def _batched_rows(df: Any, columns: tuple[str, ...], batch_size: int = BATCH_SIZE):
+    batch: list[tuple[Any, ...]] = []
+    for row in df.select(*columns).toLocalIterator():
+        batch.append(tuple(row[col] for col in columns))
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
-def flush_buffers(
-    connection: sqlite3.Connection,
-    provider_rows: list[tuple[Any, ...]],
-    procedure_rows: list[tuple[Any, ...]],
-    geography_rows: list[tuple[Any, ...]],
-    fact_rows: list[tuple[Any, ...]],
-) -> int:
-    """Flush the four in-memory row buffers to SQLite via atomic executemany calls.
+def load_standardized_frame_to_sqlite(connection: sqlite3.Connection, standardized_df: Any) -> tuple[int, int]:
+    """Load provider/procedure/geography/fact tables from a standardized Spark DataFrame."""
 
-    Dimensions are inserted first (INSERT OR IGNORE) so foreign-key constraints on
-    the fact table are always satisfied before the fact rows land.
-    Returns the number of fact rows flushed.
-    """
+    logger = logging.getLogger("cms_etl")
 
-    if not fact_rows:
-        return 0
+    provider_df = standardized_df.select(
+        "rndrg_npi",
+        "rndrg_prvdr_last_org_name",
+        "rndrg_prvdr_first_name",
+        "rndrg_prvdr_crdntl",
+        "rndrg_prvdr_type",
+    ).dropDuplicates(["rndrg_npi"])
 
-    connection.executemany(PROVIDER_INSERT_SQL, provider_rows)
-    connection.executemany(PROCEDURE_INSERT_SQL, procedure_rows)
-    connection.executemany(GEOGRAPHY_INSERT_SQL, geography_rows)
-    connection.executemany(FACT_INSERT_SQL, fact_rows)
+    procedure_df = standardized_df.select("hcpcs_cd", "hcpcs_desc").dropDuplicates(["hcpcs_cd"])
+    geography_df = standardized_df.select(
+        "rndrg_prvdr_zip5",
+        "rndrg_prvdr_state_abrvtn",
+    ).dropDuplicates(["rndrg_prvdr_zip5"])
 
-    return len(fact_rows)
+    fact_df = standardized_df.select(
+        "rndrg_npi",
+        "hcpcs_cd",
+        "rndrg_prvdr_zip5",
+        "place_of_srvc",
+        "tot_benes",
+        "tot_srvcs",
+        "avg_srvc_smtd_chrg",
+        "avg_medcr_alwd_amt",
+        "avg_medcr_pymt_amt",
+    )
+
+    provider_count = 0
+    for batch in _batched_rows(
+        provider_df,
+        (
+            "rndrg_npi",
+            "rndrg_prvdr_last_org_name",
+            "rndrg_prvdr_first_name",
+            "rndrg_prvdr_crdntl",
+            "rndrg_prvdr_type",
+        ),
+    ):
+        connection.executemany(PROVIDER_INSERT_SQL, batch)
+        provider_count += len(batch)
+
+    procedure_count = 0
+    for batch in _batched_rows(procedure_df, ("hcpcs_cd", "hcpcs_desc")):
+        connection.executemany(PROCEDURE_INSERT_SQL, batch)
+        procedure_count += len(batch)
+
+    geography_count = 0
+    for batch in _batched_rows(
+        geography_df,
+        ("rndrg_prvdr_zip5", "rndrg_prvdr_state_abrvtn"),
+    ):
+        connection.executemany(GEOGRAPHY_INSERT_SQL, batch)
+        geography_count += len(batch)
+
+    fact_count = 0
+    for batch in _batched_rows(
+        fact_df,
+        (
+            "rndrg_npi",
+            "hcpcs_cd",
+            "rndrg_prvdr_zip5",
+            "place_of_srvc",
+            "tot_benes",
+            "tot_srvcs",
+            "avg_srvc_smtd_chrg",
+            "avg_medcr_alwd_amt",
+            "avg_medcr_pymt_amt",
+        ),
+    ):
+        connection.executemany(FACT_INSERT_SQL, batch)
+        fact_count += len(batch)
+
+    logger.info(
+        "Loaded dims/facts | providers: %s | procedures: %s | geographies: %s | facts: %s",
+        provider_count,
+        procedure_count,
+        geography_count,
+        fact_count,
+    )
+
+    return fact_count, provider_count
 
 
-def run_etl() -> None:
-    """Orchestrate bulk discovery, streaming download, CSV parsing, and SQLite loading."""
+def populate_benchmarks_with_spark(connection: sqlite3.Connection, standardized_df: Any) -> int:
+    """Compute benchmark aggregates in PySpark and write to dim_benchmarks."""
+
+    _, spark_functions = _require_pyspark()
+    benchmark_df = standardized_df.filter(
+        spark_functions.col("avg_srvc_smtd_chrg").isNotNull()
+        & spark_functions.col("avg_medcr_alwd_amt").isNotNull()
+        & (spark_functions.col("avg_medcr_alwd_amt") > spark_functions.lit(0))
+        & spark_functions.col("rndrg_prvdr_type").isNotNull()
+    ).withColumn(
+        "markup_ratio",
+        spark_functions.col("avg_srvc_smtd_chrg") / spark_functions.col("avg_medcr_alwd_amt"),
+    ).groupBy("rndrg_prvdr_type", "hcpcs_cd").agg(
+        spark_functions.round(spark_functions.avg("avg_srvc_smtd_chrg"), 4).alias("peer_avg_submitted_charge"),
+        spark_functions.round(spark_functions.avg("avg_medcr_alwd_amt"), 4).alias("peer_avg_allowed_amt"),
+        spark_functions.round(spark_functions.avg("avg_medcr_pymt_amt"), 4).alias("peer_avg_payment_amt"),
+        spark_functions.round(spark_functions.avg("markup_ratio"), 6).alias("peer_avg_markup_ratio"),
+        spark_functions.count(spark_functions.lit(1)).alias("peer_row_count"),
+    )
+
+    total = 0
+    for batch in _batched_rows(
+        benchmark_df,
+        (
+            "rndrg_prvdr_type",
+            "hcpcs_cd",
+            "peer_avg_submitted_charge",
+            "peer_avg_allowed_amt",
+            "peer_avg_payment_amt",
+            "peer_avg_markup_ratio",
+            "peer_row_count",
+        ),
+    ):
+        connection.executemany(BENCHMARK_INSERT_SQL, batch)
+        total += len(batch)
+
+    return total
+
+
+def run_etl(states: tuple[str, ...], use_spark: bool = True, force_download: bool = False) -> None:
+    """Run ETL with one- or two-state ingestion and Spark-backed cleaning/benchmarks."""
 
     logger = logging.getLogger("cms_etl")
 
@@ -375,105 +596,69 @@ def run_etl() -> None:
     # ------------------------------------------------------------------ #
     # Layer 2 – Stream the archive to disk in 1 MB blocks                #
     # ------------------------------------------------------------------ #
-    # download_archive(download_url, ZIP_PATH)
+    if force_download or not ZIP_PATH.exists():
+        download_archive(download_url, ZIP_PATH)
+    else:
+        logger.info("Reusing existing archive at %s", ZIP_PATH.resolve())
+
+    if use_spark:
+        SparkSession, _ = _require_pyspark()
+    else:
+        raise RuntimeError(
+            "This ETL revision requires PySpark to standardize columns and build benchmarks."
+        )
 
     # ------------------------------------------------------------------ #
     # Layer 3 – Open database, initialize schema, and wipe fact table    #
     # ------------------------------------------------------------------ #
+    db_path = derive_db_path(states)
     logger.info(
-        "ETL target — state: %s | database: %s",
-        STATE_FILTER,
-        DB_PATH.resolve(),
+        "ETL target — states: %s | database: %s",
+        ", ".join(states),
+        db_path.resolve(),
     )
 
-    connection = open_database(DB_PATH)
+    connection = open_database(db_path)
     try:
         initialize_schema(connection, DDL_PATH)
-        _guard_state(connection, STATE_FILTER, DB_PATH)
+        _guard_states(connection, states, db_path)
 
         # Wipe previous fact rows so reruns stay idempotent. Dimension tables
         # retain their INSERT OR IGNORE protection and are not truncated.
         connection.execute("DELETE FROM fact_provider_services;")
+        connection.execute("DELETE FROM dim_benchmarks;")
         logger.info(
-            "Cleared previous %s fact records to prevent data duplication anomalies.",
-            STATE_FILTER,
+            "Cleared prior fact and benchmark data for state set %s.",
+            ", ".join(states),
         )
 
-        # ------------------------------------------------------------------ #
-        # Layer 4 + 5 – Stream CSV rows, filter, buffer, and batch-insert    #
-        # inside a single master transaction for maximum write performance.   #
-        # ------------------------------------------------------------------ #
-        
-        provider_buf: list[tuple[Any, ...]] = []
-        procedure_buf: list[tuple[Any, ...]] = []
-        geography_buf: list[tuple[Any, ...]] = []
-        fact_buf: list[tuple[Any, ...]] = []
+        csv_source = resolve_csv_source(ZIP_PATH, EXTRACTED_CSV_PATH)
 
-        total_scanned = 0
-        total_extracted = 0
-        total_inserted = 0
+        spark = SparkSession.builder.appName("cms-dual-state-etl").getOrCreate()
+        try:
+            standardized_df = build_standardized_frame(spark, csv_source, states).cache()
+            extracted_count = standardized_df.count()
+            logger.info(
+                "Spark extraction complete | states: %s | extracted rows: %s",
+                ", ".join(states),
+                extracted_count,
+            )
 
-        with connection:
-            for record in iter_csv_rows(ZIP_PATH):
-                total_scanned += 1
-
-                # In-flight state filter — skip every non-STATE_FILTER row
-                # immediately to keep memory footprint near zero for the national file.
-                if clean_text(
-                    get_source_value(record, "rndrng_prvdr_state_abrvtn")
-                ) != STATE_FILTER:
-                    continue
-
-                total_extracted += 1
-
-                provider_row, procedure_row, geography_row, fact_row = normalize_row(record)
-
-                # Guard against rows where any business key is absent.
-                if not provider_row[0] or not procedure_row[0] or not geography_row[0]:
-                    logger.warning(
-                        "Skipping record with missing business key fields: %s", record
-                    )
-                    continue
-
-                provider_buf.append(provider_row)
-                procedure_buf.append(procedure_row)
-                geography_buf.append(geography_row)
-                fact_buf.append(fact_row)
-
-                # Flush every BATCH_SIZE qualifying rows to keep buffer RAM bounded.
-                if len(fact_buf) >= BATCH_SIZE:
-                    flushed = flush_buffers(
-                        connection, provider_buf, procedure_buf, geography_buf, fact_buf
-                    )
-                    total_inserted += flushed
-                    logger.info(
-                        "Flushed batch: %s rows inserted | "
-                        "extracted so far: %s | scanned so far: %s",
-                        flushed,
-                        total_extracted,
-                        total_scanned,
-                    )
-                    provider_buf.clear()
-                    procedure_buf.clear()
-                    geography_buf.clear()
-                    fact_buf.clear()
-
-            # Flush any remaining rows that did not fill a complete batch.
-            if fact_buf:
-                flushed = flush_buffers(
-                    connection, provider_buf, procedure_buf, geography_buf, fact_buf
+            with connection:
+                inserted_fact_count, _ = load_standardized_frame_to_sqlite(
+                    connection,
+                    standardized_df,
                 )
-                total_inserted += flushed
-                logger.info(
-                    "Flushed final partial batch: %s rows inserted.", flushed
-                )
+                benchmark_count = populate_benchmarks_with_spark(connection, standardized_df)
 
-        logger.info(
-            "ETL complete | scanned: %s | NC extracted: %s | inserted: %s",
-            total_scanned,
-            total_extracted,
-            total_inserted,
-        )
+            logger.info(
+                "ETL complete | extracted: %s | facts inserted: %s | benchmark groups: %s",
+                extracted_count,
+                inserted_fact_count,
+                benchmark_count,
+            )
+        finally:
+            spark.stop()
     except Exception:
         logger.exception("CMS ETL pipeline failed")
         raise
@@ -481,12 +666,47 @@ def run_etl() -> None:
         connection.close()
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
+    """CLI options for one- or two-state ETL plus Spark execution controls."""
 
+    parser = argparse.ArgumentParser(
+        description="Run CMS Part B ETL with optional dual-state targeting and PySpark transforms."
+    )
+    parser.add_argument(
+        "--states",
+        default=STATE_FILTER,
+        help="One or two state codes, comma-delimited. Example: 'FL' or 'FL, GA'.",
+    )
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        help="Always download the latest archive, even if data/cms_source.zip exists.",
+    )
+    parser.add_argument(
+        "--no-spark",
+        action="store_true",
+        help="Reserved for future compatibility. Current ETL path requires PySpark.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
     """Entry point for running the ETL pipeline as a script."""
 
     configure_logging()
-    run_etl()
+    args = parse_args()
+
+    states = parse_states(args.states)
+    if args.no_spark:
+        raise RuntimeError(
+            "This ETL revision requires PySpark to standardize columns and build benchmarks."
+        )
+
+    run_etl(
+        states=states,
+        use_spark=True,
+        force_download=args.force_download,
+    )
 
 
 if __name__ == "__main__":
