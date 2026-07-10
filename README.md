@@ -1,6 +1,6 @@
 # Insight — CMS Part B Provider Compliance Analytics Engine
 
-A production-grade Python ETL and outlier detection system that streams CMS Medicare Part B national bulk data, loads it into a normalized SQLite star schema, and surfaces billing anomalies via SQL analytical views, AI-generated audit narratives, and PDF compliance memos.
+A production-grade Python ETL and outlier detection system that streams CMS Medicare Part B national bulk data, loads it into a normalized SQLite star schema, and surfaces billing anomalies via SQL analytical views and PDF compliance memos.
 
 ---
 
@@ -8,9 +8,9 @@ A production-grade Python ETL and outlier detection system that streams CMS Medi
 
 ```
 etl_pipeline.py           # Bulk streaming ETL: discovery → download → CSV parse → SQLite load
+schema_router.py          # SQL file reader, identifier aliasing, and DB schema reconciliation
 diagnostics.py            # Health check: row counts, view validation, join integrity
-ai_reporter.py            # AI layer: anomaly context packaging + narrative generation
-pdf_report.py             # PDF generation: renders AI memos into compliance audit reports for human analysts
+pdf_report.py             # PDF generation: renders audit narratives into compliance memos
 
 queries/
   ddl_schema.sql                      # Star schema DDL: all tables, foreign keys, and indexes
@@ -19,12 +19,15 @@ queries/
   v_em_upcoding_anomalies.sql         # View: providers with > 50% level-5 E/M coding share
   v_provider_peer_benchmark.sql       # View: all-provider benchmark deviation table
 
+project_relational_stack.dot  # Graphviz source for the architecture diagram
+project_relational_stack.svg  # Rendered architecture diagram
+
 data/
   cms_source.zip          # Downloaded CMS bulk archive (gitignored)
   cms_outliers.db         # SQLite warehouse (gitignored)
 
 reports/                  # Generated PDF audit memos (gitignored)
-.env                      # Local secrets: API_KEY (gitignored)
+.env                      # Local secrets: OPENROUTER_API_KEY (gitignored)
 ```
 
 ---
@@ -89,15 +92,37 @@ PySpark now rebuilds `dim_benchmarks` inside `etl_pipeline.py`, so no separate S
 python diagnostics.py
 ```
 
+Target a specific state database:
+
+```bash
+python diagnostics.py --state FL
+```
+
+Or pass an explicit database path:
+
+```bash
+python diagnostics.py --db data/cms_outliers_fl_ga.db
+```
+
 Validates row counts across all tables and views, checks join integrity, and warns if the benchmark table is empty.
 
-### 6. Generate AI audit memos (PDF)
+### 6. Generate PDF compliance memos
 
 ```bash
 python pdf_report.py
 ```
 
-Generates one PDF compliance memo per top-ranked anomaly in `reports/`.
+Generates one PDF compliance memo per top-ranked anomaly in `reports/`. By default produces deterministic rule-based narratives for the top 10 anomalies.
+
+Optional flags:
+
+```bash
+python pdf_report.py --limit 5            # Report only the top 5 anomalies
+python pdf_report.py --db data/cms_outliers_fl.db  # Target a specific database
+python pdf_report.py --use-ai             # Use AI narratives via OpenRouter (requires OPENROUTER_API_KEY and ai_reporter.py)
+```
+
+> **Note:** The `--use-ai` flag requires `ai_reporter.py` (not yet present in this repository) and a valid `OPENROUTER_API_KEY` in `.env`. Without it the pipeline falls back to deterministic narratives automatically.
 
 ---
 
@@ -131,15 +156,22 @@ Peer groups are defined as all service lines sharing the same `Rndrg_Prvdr_Type`
 | `v_provider_peer_benchmark` | Allowed amount ≥ 40% above peer average | 40 |
 | `v_provider_peer_benchmark` | Allowed amount 25–39% above peer average | 20 |
 
-### AI Model
+### AI Narrative Layer (Planned)
 
-The AI narrative layer uses **`google/gemini-flash-1.5`** via OpenRouter (~$0.075/M input tokens) as the default model. To switch models, set `DEFAULT_MODEL` in `ai_reporter.py`. Recommended alternatives:
+PDF memos can optionally include AI-generated audit narratives via OpenRouter when `--use-ai` is passed to `pdf_report.py`. This feature requires:
+
+1. `ai_reporter.py` — not yet present in this repository
+2. `OPENROUTER_API_KEY` set in `.env`
+
+When `ai_reporter.py` is implemented, the intended default model is **`google/gemini-flash-1.5`** via OpenRouter (~$0.075/M input tokens). Recommended alternatives:
 
 | Model | Best For |
 |---|---|
 | `google/gemini-flash-1.5` | Default — fast, cheap, coherent |
 | `meta-llama/llama-3.1-70b-instruct` | Stronger reasoning, open weights |
 | `anthropic/claude-3-haiku` | Most coherent long-form compliance |
+
+Without `ai_reporter.py`, `pdf_report.py` produces deterministic rule-based narratives for all anomalies.
 
 ---
 
@@ -173,5 +205,5 @@ The pipeline resolves the current bulk archive URL dynamically at runtime — no
 
 - All monetary thresholds (1.20× markup, 40% allowed amount variance) are configurable in the respective SQL view files under `queries/`.
 - The benchmark peer group minimum of 10 service lines prevents false flags on rare specialty/CPT combinations.
-- AI narratives are clearly labeled as AI-assisted and must be reviewed by a qualified analyst before distribution.
+- AI narratives (when `ai_reporter.py` is present) are clearly labeled as AI-assisted and must be reviewed by a qualified analyst before distribution.
 - The `.env` file is gitignored. Never commit API keys to version control.
