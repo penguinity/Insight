@@ -37,7 +37,12 @@ FPDF = cast(Any, _FPDF)
 XPos = cast(Any, _XPos)
 YPos = cast(Any, _YPos)
 
-from ai_reporter import build_audit_context, fetch_top_anomalies, generate_audit_narrative
+from ai_reporter import (
+    DEFAULT_MODEL,
+    build_audit_context,
+    fetch_top_anomalies,
+    generate_audit_narrative,
+)
 
 REPORTS_DIR = Path("reports")
 LEGACY_DB_PATH = Path("data/cms_outliers.db")
@@ -47,6 +52,56 @@ COLOR_NAVY = (0, 51, 102)
 COLOR_LIGHT_BLUE = (230, 240, 255)
 COLOR_GREY = (128, 128, 128)
 COLOR_BLACK = (30, 30, 30)
+
+
+def _parse_states(raw_states: str) -> tuple[str, ...]:
+    """Parse one or two comma-delimited state codes into uppercase values."""
+
+    cleaned = [part.strip().upper() for part in raw_states.split(",") if part.strip()]
+    if not cleaned:
+        raise ValueError("Provide at least one state, e.g. 'NC' or 'NC, GA'")
+
+    unique_states: list[str] = []
+    for state in cleaned:
+        if len(state) != 2 or not state.isalpha():
+            raise ValueError(f"Invalid state code: {state}")
+        if state not in unique_states:
+            unique_states.append(state)
+
+    if len(unique_states) > 2:
+        raise ValueError(
+            "PDF reporting supports one or two states per run. "
+            "Example: --states 'NC, GA'"
+        )
+    return tuple(unique_states)
+
+
+def _derive_db_path_for_states(states: tuple[str, ...]) -> Path:
+    """Build state-scoped database path using ETL naming convention."""
+
+    normalized = [state.lower() for state in states]
+    return Path(f"data/cms_outliers_{'_'.join(normalized)}.db")
+
+
+def _build_narrative_metadata(
+    *,
+    source: str,
+    ai_requested: bool,
+    ai_attempted: bool,
+    ai_success: bool,
+    model: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Return a consistent metadata payload for narrative source transparency."""
+
+    return {
+        "source": source,
+        "ai_requested": ai_requested,
+        "ai_attempted": ai_attempted,
+        "ai_success": ai_success,
+        "model": model,
+        "reason": reason,
+    }
 
 
 def _pdf_safe_text(value: Any) -> str:
@@ -140,6 +195,7 @@ def _kv_row(pdf: Any, label: str, value: Any) -> None:
 def render_audit_memo(
     audit_context: dict[str, Any],
     narrative: str,
+    narrative_meta: dict[str, Any],
     output_path: Path,
 ) -> None:
     """Render one provider anomaly record into a single-page PDF compliance memo."""
@@ -209,8 +265,21 @@ def render_audit_memo(
     _kv_row(pdf, "Risk Tier", risk_label)
     pdf.ln(3)
 
-    # ---- AI Narrative ------------------------------------------------- #
-    _section_heading(pdf, "ANALYST NARRATIVE  (AI-ASSISTED — REVIEW BEFORE DISTRIBUTION)")
+    # ---- Narrative Source + Narrative -------------------------------- #
+    source_label = "AI GENERATED" if narrative_meta.get("source") == "ai" else "BENCHMARK-BASED"
+    _section_heading(pdf, f"ANALYST NARRATIVE ({source_label})")
+    _kv_row(
+        pdf,
+        "Narrative Source",
+        "OpenRouter AI response" if narrative_meta.get("source") == "ai" else "Deterministic benchmark/SQL rules",
+    )
+    _kv_row(pdf, "AI Requested", "Yes" if narrative_meta.get("ai_requested") else "No")
+    _kv_row(pdf, "AI Attempted", "Yes" if narrative_meta.get("ai_attempted") else "No")
+    _kv_row(pdf, "AI Success", "Yes" if narrative_meta.get("ai_success") else "No")
+    _kv_row(pdf, "Model", narrative_meta.get("model") or "N/A")
+    _kv_row(pdf, "Method Detail", narrative_meta.get("reason") or "N/A")
+    pdf.ln(2)
+
     pdf.set_font("Helvetica", "", 9)
     pdf.set_text_color(*COLOR_BLACK)
     pdf.multi_cell(
@@ -257,6 +326,42 @@ def _resolve_target_db_path(db_override: Path | None = None) -> Path:
         return max(state_dbs.values(), key=lambda path: path.stat().st_mtime)
 
     return LEGACY_DB_PATH
+
+
+def _resolve_target_db_path_with_states(
+    logger: logging.Logger,
+    db_override: Path | None = None,
+    states: tuple[str, ...] | None = None,
+) -> Path | None:
+    """Resolve report target path with optional one/two-state filtering."""
+
+    if db_override is not None:
+        return db_override
+
+    if states is not None:
+        state_db = _derive_db_path_for_states(states)
+        if state_db.exists():
+            return state_db
+
+        requested = ", ".join(states)
+        logger.warning(
+            "No database found for requested state filter '%s' at %s",
+            requested,
+            state_db,
+        )
+        logger.warning(
+            "Run ETL first: python etl_pipeline.py --states \"%s\"",
+            requested,
+        )
+        available = _discover_state_databases()
+        if available:
+            logger.warning(
+                "Available state databases in data/: %s",
+                ", ".join(sorted(available.keys())),
+            )
+        return None
+
+    return _resolve_target_db_path(db_override)
 
 
 def _state_tag_from_db_path(db_path: Path) -> str:
@@ -321,6 +426,11 @@ def parse_args() -> argparse.Namespace:
         help="Explicit SQLite database path. Defaults to latest state DB.",
     )
     parser.add_argument(
+        "--states NC",
+        type=str,
+        help="One or two state codes, comma-delimited (e.g., 'NC' or 'NC, GA').",
+    )
+    parser.add_argument(
         "--use-ai",
         action="store_true",
         help="Enable AI narrative generation via OpenRouter when API key is configured.",
@@ -332,12 +442,20 @@ def generate_report_batch(
     limit: int = 10,
     db_path: Path | None = None,
     use_ai: bool = False,
+    states: tuple[str, ...] | None = None,
 ) -> None:
     """Generate terminal summaries plus one timestamped PDF per top anomaly row."""
     logger = logging.getLogger("cms_pdf")
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    target_db = _resolve_target_db_path(db_path)
+    target_db = _resolve_target_db_path_with_states(
+        logger=logger,
+        db_override=db_path,
+        states=states,
+    )
+    if target_db is None:
+        return
+
     state_tag = _state_tag_from_db_path(target_db)
     logger.info("Report target database: %s", target_db.resolve())
     logger.info("Report state scope tag: %s", state_tag)
@@ -355,7 +473,6 @@ def generate_report_batch(
 
     run_stamp = _timestamp_suffix()
     has_api_key = bool(os.getenv("OPENROUTER_API_KEY"))
-    ai_enabled = use_ai and has_api_key
     if use_ai and not has_api_key:
         logger.warning("--use-ai supplied but OPENROUTER_API_KEY is not set; using deterministic narrative.")
 
@@ -364,20 +481,63 @@ def generate_report_batch(
         _print_terminal_summary(i, len(anomalies), context)
 
         narrative = _deterministic_narrative(context)
-        if ai_enabled:
+        narrative_meta = _build_narrative_metadata(
+            source="benchmark",
+            ai_requested=use_ai,
+            ai_attempted=False,
+            ai_success=False,
+            model="N/A",
+            reason="Deterministic benchmark narrative selected.",
+        )
+
+        if use_ai and has_api_key:
+            narrative_meta = _build_narrative_metadata(
+                source="benchmark",
+                ai_requested=True,
+                ai_attempted=True,
+                ai_success=False,
+                model=DEFAULT_MODEL,
+                reason="AI request attempted; awaiting response status.",
+            )
             try:
                 narrative = generate_audit_narrative(context)
+                narrative_meta = _build_narrative_metadata(
+                    source="ai",
+                    ai_requested=True,
+                    ai_attempted=True,
+                    ai_success=True,
+                    model=DEFAULT_MODEL,
+                    reason="OpenRouter returned a model-generated narrative.",
+                )
             except Exception as exc:
                 logger.warning(
                     "AI narrative unavailable for anomaly %d; using deterministic fallback. Error: %s",
                     i,
                     exc,
                 )
+                narrative = _deterministic_narrative(context)
+                narrative_meta = _build_narrative_metadata(
+                    source="benchmark",
+                    ai_requested=True,
+                    ai_attempted=True,
+                    ai_success=False,
+                    model=DEFAULT_MODEL,
+                    reason=f"AI request failed: {exc}",
+                )
+        elif use_ai and not has_api_key:
+            narrative_meta = _build_narrative_metadata(
+                source="benchmark",
+                ai_requested=True,
+                ai_attempted=False,
+                ai_success=False,
+                model="N/A",
+                reason="OPENROUTER_API_KEY not set; deterministic fallback used.",
+            )
 
         file_name = f"{state_tag}-{run_stamp}-{i:02d}.pdf"
         out_path = REPORTS_DIR / file_name
         if FPDF_AVAILABLE:
-            render_audit_memo(context, narrative, out_path)
+            render_audit_memo(context, narrative, narrative_meta, out_path)
             logger.info("Generated report %d/%d: %s", i, len(anomalies), out_path.name)
 
     logger.info("Batch complete — %d reports written to %s/", len(anomalies), REPORTS_DIR)
@@ -389,8 +549,21 @@ if __name__ == "__main__":
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
     cli_args = parse_args()
+    if cli_args.db and cli_args.states:
+        logging.getLogger("cms_pdf").error("Use either --db or --states, not both.")
+        raise SystemExit(2)
+
+    parsed_states: tuple[str, ...] | None = None
+    if cli_args.states:
+        try:
+            parsed_states = _parse_states(cli_args.states)
+        except ValueError as exc:
+            logging.getLogger("cms_pdf").error("%s", exc)
+            raise SystemExit(2) from exc
+
     generate_report_batch(
         limit=cli_args.limit,
         db_path=cli_args.db,
         use_ai=cli_args.use_ai,
+        states=parsed_states,
     )
