@@ -49,8 +49,9 @@ def parse_args() -> argparse.Namespace:
         help="Explicit path to a SQLite file (overrides default state target).",
     )
     parser.add_argument(
-        "--state",
+        "--state NC",
         type=str,
+        metavar="XX",
         help="Two-letter state abbreviation (e.g., AL, NC).",
     )
     return parser.parse_args()
@@ -59,28 +60,29 @@ def parse_args() -> argparse.Namespace:
 def resolve_target_db_path(args: argparse.Namespace) -> tuple[Path, str]:
     """Resolve target database path from CLI args with clear precedence rules."""
 
-    if args.db and args.state:
+    explicit_db = getattr(args, "db", None)
+    explicit_state = getattr(args, "state", None)
+
+    if explicit_db and explicit_state:
         raise ValueError("Use either --db or --state, not both in the same run")
 
-    if args.db:
-        return args.db, "custom"
+    if explicit_db:
+        return explicit_db, "custom"
 
-    if args.state:
-        normalized_state = args.state.strip().upper()
+    if explicit_state:
+        normalized_state = explicit_state.strip().upper()
         return build_db_path_for_state(normalized_state), normalized_state
 
     state_dbs = discover_state_databases()
-    if len(state_dbs) == 1:
-        only_state, only_path = next(iter(state_dbs.items()))
-        return only_path, only_state
-
-    if len(state_dbs) > 1:
-        available = ", ".join(state_dbs.keys())
-        raise ValueError(
-            "Multiple state databases detected. "
-            "Specify --state <XX> or --db <path>. "
-            f"Available states: {available}"
+    if state_dbs:
+        latest_state, latest_path = max(
+            state_dbs.items(),
+            key=lambda item: item[1].stat().st_mtime,
         )
+        logging.getLogger("cms_diagnostics").info(
+            "No state specified, running last created database diagnostics."
+        )
+        return latest_path, latest_state
 
     return DB_PATH, "legacy-default"
 
