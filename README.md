@@ -1,177 +1,235 @@
-# Insight — CMS Part B Provider Compliance Analytics Engine
+# Insight
 
-A production-grade Python ETL and outlier detection system that streams CMS Medicare Part B national bulk data, loads it into a normalized SQLite star schema, and surfaces billing anomalies via SQL analytical views, AI-generated audit narratives, and PDF compliance memos.
+CMS Part B Provider Data, Benchmarks, and Analysis is a Python + SQLite analytics project for ingesting national CMS Part B provider/service data, normalizing it into a relational star schema, and surfacing outlier patterns through SQL views, diagnostics, and PDF reporting.
 
----
+This README reflects the repository in its current state and aligns with shipped work shown in recent commits.
 
-## Project Structure
+## Current Status
 
-```
-etl_pipeline.py           # Bulk streaming ETL: discovery → download → CSV parse → SQLite load
-diagnostics.py            # Health check: row counts, view validation, join integrity
-ai_reporter.py            # AI layer: anomaly context packaging + narrative generation
-pdf_report.py             # PDF generation: renders AI memos into compliance audit reports for human analysts
+- ETL, schema creation, benchmarking, diagnostics, and PDF reporting are implemented and runnable.
+- State-scoped database targeting is implemented for one or two states per ETL run.
+- SQL view-based anomaly scoring is implemented.
+- AI narrative plumbing exists, but the AI layer is not released as a production feature.
 
-queries/
-  ddl_schema.sql                      # Star schema DDL: all tables, foreign keys, and indexes
-  populate_dim_benchmarks.sql         # Peer group benchmark computation (run after each ETL load)
-  v_billing_elasticity_anomalies.sql  # View: providers with markup ratio > 1.2x peer baseline
-  v_em_upcoding_anomalies.sql         # View: providers with > 50% level-5 E/M coding share
-  v_provider_peer_benchmark.sql       # View: all-provider benchmark deviation table
+## Development Note (AI Layer)
 
-data/
-  cms_source.zip          # Downloaded CMS bulk archive (gitignored)
-  cms_outliers.db         # SQLite warehouse (gitignored)
+The AI narrative component is still in development and is not released for production use.
 
-reports/                  # Generated PDF audit memos (gitignored)
-.env                      # Local secrets: API_KEY (gitignored)
-```
+- `ai_reporter.py` is present and callable.
+- `pdf_report.py` defaults to deterministic non-AI narratives.
+- AI output is only attempted when `--use-ai` is passed and `OPENROUTER_API_KEY` is configured.
+- Treat generated narratives as draft analyst assist text, not final compliance determinations.
 
----
+## Repository Scope
 
-## Quickstart
+### Core Python scripts
 
-### 1. Install dependencies
+- `etl_pipeline.py`
+  - Discovers CMS bulk URL from `https://data.cms.gov/data.json`
+  - Downloads archive to `data/cms_source.zip`
+  - Extracts CSV if needed
+  - Uses PySpark to normalize source columns and filter one/two states
+  - Loads star schema tables in SQLite
+  - Rebuilds `dim_benchmarks` with PySpark aggregates
+
+- `diagnostics.py`
+  - Verifies table and view row counts
+  - Checks join integrity (`fact_provider_services` -> `dim_providers`)
+  - Validates benchmark coverage
+  - Resolves target DB by `--db`, `--state`, or auto-selection rules
+
+- `schema_router.py`
+  - Normalizes legacy SQL identifier aliases (`Rndrng_*` -> `Rndrg_*`)
+  - Reconciles schema objects and view SQL in existing databases
+
+- `pdf_report.py`
+  - Fetches top anomalies
+  - Prints terminal summaries
+  - Generates branded PDF compliance memos in `reports/`
+  - Supports optional AI narratives via `--use-ai`
+
+- `ai_reporter.py`
+  - Converts anomaly rows into structured audit context
+  - Calls OpenRouter when enabled/configured
+  - Returns fallback narrative when API key is absent
+
+### SQL assets (`queries/`)
+
+- `ddl_schema.sql` - canonical SQLite schema (dimensions, fact table, indexes, benchmark table)
+- `populate_dim_benchmarks.sql` - SQL benchmark rebuild script (still used by schema reconciliation path)
+- `v_billing_elasticity_anomalies.sql` - billing elasticity risk flags
+- `v_em_upcoding_anomalies.sql` - E/M level-5 utilization outlier flags
+- `v_provider_peer_benchmark.sql` - provider vs peer variance metrics and scoring
+
+### Other repository files
+
+- `requirements.txt` - pinned/runtime dependencies
+- `project_relational_stack.dot` - architecture/relational graph source
+- `quick test.py` - local exploratory helper script for inspecting raw state column values
+- `reference/CMS API.txt` - reference notes
+
+## Commit-Based Milestones
+
+Recent commits indicate this delivery sequence:
+
+- `feat: initial ingestion ETL engine and star schema framework for Insight`
+- `feat(data): implement provider service star schema diagnostics`
+- `feat: implement state-parameterized ETL pipeline`
+- `feat: added PySpark dual state filtering and benchmarking`
+- `fixed critial virtual env & local dependencies issues, added requirements.txt, added relational stack diagram`
+- `feat: release initial version of pdf report generation`
+
+Supporting maintenance commits include `.gitignore` adjustments and removal of incomplete scripts.
+
+## Data Model
+
+### Star schema tables
+
+- `dim_providers`
+- `dim_procedures`
+- `dim_geography`
+- `fact_provider_services`
+- `dim_benchmarks`
+
+The fact table links to the three dimensions with foreign keys and stores CMS service/amount metrics used by anomaly views.
+
+### View logic summary
+
+- `v_billing_elasticity_anomalies`
+  - Flags rows when provider markup ratio exceeds peer baseline by >20% and peer group size >= 10
+  - Assigns 35 risk points
+
+- `v_em_upcoding_anomalies`
+  - Flags NPIs where HCPCS `99215` exceeds 50% share of E/M volume with at least 50 E/M services
+  - Assigns 30 risk points
+
+- `v_provider_peer_benchmark`
+  - Computes provider deltas and percent deltas vs specialty/CPT peers
+  - Scores 40 points for >=40% allowed amount variance (peer group >=20)
+  - Scores 20 points for >=25% allowed amount variance (peer group >=20)
+
+## Environment and Dependencies
+
+Install project dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Windows note:
-- `etl_pipeline.py` now auto-hardens `SPARK_HOME` to a safe junction path (`C:\\sparklink_cms`) when PySpark is installed under a path with spaces or `&`.
-- This resolves the recurring `[JAVA_GATEWAY_EXITED]` startup failure without manual reconfiguration each run.
+Current requirements:
 
-### 2. Configure environment
+- `fpdf2>=2.8,<3`
+- `pyspark==4.1.2`
+- `python-dotenv>=1.0,<2`
+- `requests>=2.32,<3`
 
-Add your API key to `.env`:
+Optional `.env` for AI development/testing:
 
+```env
+OPENROUTER_API_KEY=your_key_here
 ```
-OPENROUTER_API_KEY=sk-or-...
-```
 
-### 3. Run the ETL pipeline
+## Quickstart
+
+### 1. Run ETL
+
+Default states in code are currently `FL, GA`.
 
 ```bash
 python etl_pipeline.py
 ```
 
-Single-state explicit run:
+Single-state example:
 
 ```bash
 python etl_pipeline.py --states "FL"
 ```
 
-Dual-state run in one database:
+Dual-state example:
 
 ```bash
 python etl_pipeline.py --states "FL, GA"
 ```
 
-The pipeline will:
-- Fetch `data.cms.gov/data.json` to locate the latest bulk archive URL
-- Stream the archive to `data/cms_source.zip` in 1 MB blocks
-- Use PySpark to clean and standardize CMS columns in batch
-- Filter rows to one or two states from `--states` (supports `STATE` or `STATE, STATE`)
-- Batch-insert every 10,000 qualifying rows into the SQLite star schema
-- Build `dim_benchmarks` directly with PySpark aggregations for the selected state set
+Force new archive download:
 
-Database naming:
-- `--states "FL"` writes to `data/cms_outliers_fl.db`
-- `--states "FL, GA"` writes to `data/cms_outliers_fl_ga.db`
+```bash
+python etl_pipeline.py --states "FL, GA" --force-download
+```
 
-### 4. Populate the benchmark table
+### 2. Run diagnostics
 
-PySpark now rebuilds `dim_benchmarks` inside `etl_pipeline.py`, so no separate SQL benchmark refresh is required for normal ETL runs.
-
-### 5. Run diagnostics
+Auto-target DB (with ambiguity protection):
 
 ```bash
 python diagnostics.py
 ```
 
-Validates row counts across all tables and views, checks join integrity, and warns if the benchmark table is empty.
-
-### 6. Generate AI audit memos (PDF)
+Target by state:
 
 ```bash
-python pdf_report.py
+python diagnostics.py --state FL
 ```
 
-Generates one PDF compliance memo per top-ranked anomaly in `reports/`.
-
----
-
-## Outlier Detection Methodology
-
-### Star Schema
-
-| Table | Purpose |
-|---|---|
-| `fact_provider_services` | One row per NPI × HCPCS × place-of-service combination |
-| `dim_providers` | Provider name, specialty, and credentials |
-| `dim_procedures` | HCPCS code descriptions |
-| `dim_geography` | ZIP code and state |
-| `dim_benchmarks` | Pre-computed peer group averages per specialty/CPT |
-
-### Statistical Benchmarks
-
-Peer groups are defined as all service lines sharing the same `Rndrg_Prvdr_Type` (specialty) and `Hcpcs_Cd` (procedure code). The benchmark table stores:
-
-- **`Peer_Avg_Markup_Ratio`** — `AVG(submitted_charge / allowed_amount)` across the peer group
-- **`Peer_Avg_Allowed_Amt`** — Average Medicare allowed amount per service line
-- **`Peer_Avg_Payment_Amt`** — Average Medicare payment amount per service line
-- **`Peer_Row_Count`** — Number of service lines in the peer group (minimum 10 required to flag)
-
-### Anomaly Flags
-
-| View | Condition | Risk Points |
-|---|---|---|
-| `v_billing_elasticity_anomalies` | Provider markup ratio > 1.20× peer group baseline, peer group ≥ 10 | 35 |
-| `v_em_upcoding_anomalies` | Level-5 E/M (99215) share > 50% with ≥ 50 total E/M services | 30 |
-| `v_provider_peer_benchmark` | Allowed amount ≥ 40% above peer average | 40 |
-| `v_provider_peer_benchmark` | Allowed amount 25–39% above peer average | 20 |
-
-### AI Model
-
-The AI narrative layer uses **`google/gemini-flash-1.5`** via OpenRouter (~$0.075/M input tokens) as the default model. To switch models, set `DEFAULT_MODEL` in `ai_reporter.py`. Recommended alternatives:
-
-| Model | Best For |
-|---|---|
-| `google/gemini-flash-1.5` | Default — fast, cheap, coherent |
-| `meta-llama/llama-3.1-70b-instruct` | Stronger reasoning, open weights |
-| `anthropic/claude-3-haiku` | Most coherent long-form compliance |
-
----
-
-## Rerunning the Pipeline
-
-To perform a full wipe-and-reload:
+Target by explicit path:
 
 ```bash
-# 1. Re-run ETL (clears fact table automatically before reload)
-python etl_pipeline.py --states "FL, GA"
-
-# 2. Validate
-python diagnostics.py
-
-# 3. Generate reports
-python pdf_report.py
+python diagnostics.py --db data/cms_outliers_fl_ga.db
 ```
 
----
+### 3. Generate reports
+
+Deterministic narratives (default):
+
+```bash
+python pdf_report.py --limit 10
+```
+
+Enable AI narrative attempt (development only):
+
+```bash
+python pdf_report.py --limit 10 --use-ai
+```
+
+Optional explicit DB target:
+
+```bash
+python pdf_report.py --db data/cms_outliers_fl_ga.db --limit 10
+```
+
+## Database Naming and Targeting
+
+ETL writes state-scoped databases:
+
+- One state: `data/cms_outliers_<state>.db` (example: `data/cms_outliers_fl.db`)
+- Two states: `data/cms_outliers_<state1>_<state2>.db` (example: `data/cms_outliers_fl_ga.db`)
+
+ETL also stores state filter metadata and prevents accidental reuse of a database with mismatched state scope.
+
+## Windows PySpark Note
+
+On Windows, if PySpark is installed in a path containing spaces or `&`, Spark startup can fail with `JAVA_GATEWAY_EXITED`.
+
+`etl_pipeline.py` mitigates this by creating and using a safe junction path (`C:\sparklink_cms`) for `SPARK_HOME` when required.
+
+## Outputs
+
+- SQLite database files under `data/`
+- Extracted CSV cache: `data/cms_source_extracted.csv` (when archive extraction is needed)
+- PDF compliance memos under `reports/`
+
+## Known Limitations
+
+- AI layer is development-only and not production-released.
+- `etl_pipeline.py --no-spark` is intentionally unsupported in the current revision and raises an error.
+- `quick test.py` is a local utility script, not a production pipeline component.
 
 ## Data Source
 
-**CMS Medicare Physician & Other Practitioners — by Provider and Service**  
-Source: [data.cms.gov](https://data.cms.gov)  
-Catalog endpoint: `https://data.cms.gov/data.json`  
-The pipeline resolves the current bulk archive URL dynamically at runtime — no hardcoded dataset IDs.
+- CMS dataset: Medicare Physician & Other Practitioners - by Provider and Service
+- Metadata catalog endpoint: https://data.cms.gov/data.json
+- The ETL dynamically discovers current distribution URLs from the catalog.
 
----
+## License
 
-## Notes for Analysts
-
-- All monetary thresholds (1.20× markup, 40% allowed amount variance) are configurable in the respective SQL view files under `queries/`.
-- The benchmark peer group minimum of 10 service lines prevents false flags on rare specialty/CPT combinations.
-- AI narratives are clearly labeled as AI-assisted and must be reviewed by a qualified analyst before distribution.
-- The `.env` file is gitignored. Never commit API keys to version control.
+See `LICENSE`.
