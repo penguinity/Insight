@@ -259,6 +259,88 @@ def run_diagnostics(db_path: Path = DB_PATH) -> None:
     except Exception as exc:
         logger.warning("  dim_benchmarks missing or inaccessible: %s", exc)
 
+    # ------------------------------------------------------------------ #
+    # 7. Peer benchmark fairness check                                    #
+    # Ensure benchmarking keys stay specialty-specific and service-specific.
+    # ------------------------------------------------------------------ #
+    logger.info("=" * 55)
+    logger.info("PEER BENCHMARK FAIRNESS (SPECIALTY + HCPCS)")
+    logger.info("=" * 55)
+    try:
+        eligible_rows = cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM fact_provider_services f
+            JOIN dim_providers p
+                ON p.Rndrg_Npi = f.Rndrg_Npi
+            WHERE p.Rndrg_Prvdr_Type IS NOT NULL
+              AND TRIM(p.Rndrg_Prvdr_Type) <> ''
+              AND f.Hcpcs_Cd IS NOT NULL
+              AND f.Avg_Srvc_Smtd_Chrg IS NOT NULL
+              AND f.Avg_Medcr_Alwd_Amt IS NOT NULL
+              AND f.Avg_Medcr_Alwd_Amt > 0
+            """
+        ).fetchone()[0]
+
+        covered_rows = cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM fact_provider_services f
+            JOIN dim_providers p
+                ON p.Rndrg_Npi = f.Rndrg_Npi
+            JOIN dim_benchmarks b
+                ON b.Rndrg_Prvdr_Type = p.Rndrg_Prvdr_Type
+               AND b.Hcpcs_Cd = f.Hcpcs_Cd
+            WHERE p.Rndrg_Prvdr_Type IS NOT NULL
+              AND TRIM(p.Rndrg_Prvdr_Type) <> ''
+              AND f.Hcpcs_Cd IS NOT NULL
+              AND f.Avg_Srvc_Smtd_Chrg IS NOT NULL
+              AND f.Avg_Medcr_Alwd_Amt IS NOT NULL
+              AND f.Avg_Medcr_Alwd_Amt > 0
+            """
+        ).fetchone()[0]
+
+        unmatched_rows = eligible_rows - covered_rows
+        coverage_pct = (covered_rows / eligible_rows * 100) if eligible_rows else 0
+
+        logger.info(
+            "  Peer key enforced: Rndrg_Prvdr_Type + Hcpcs_Cd"
+        )
+        logger.info(
+            "  Eligible service rows: %d | Matched to peer key: %d (%.1f%%) | Unmatched: %d",
+            eligible_rows,
+            covered_rows,
+            coverage_pct,
+            unmatched_rows,
+        )
+
+        view_integrity_gap = cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM v_billing_elasticity_anomalies v
+            LEFT JOIN dim_benchmarks b
+                ON b.Rndrg_Prvdr_Type = v.Rndrg_Prvdr_Type
+               AND b.Hcpcs_Cd = v.Hcpcs_Cd
+            WHERE b.Benchmark_Id IS NULL
+            """
+        ).fetchone()[0]
+        logger.info(
+            "  Billing anomaly rows lacking same-specialty benchmark key: %d",
+            view_integrity_gap,
+        )
+
+        if unmatched_rows > 0 or view_integrity_gap > 0:
+            logger.warning(
+                "  Some rows are not benchmarked against same-specialty peers. "
+                "Review dim_benchmarks refresh and provider type completeness."
+            )
+        else:
+            logger.info(
+                "  Fairness check passed: benchmarks are specialty-specific and HCPCS-specific."
+            )
+    except Exception as exc:
+        logger.warning("  Peer fairness check failed: %s", exc)
+
     conn.close()
     logger.info("=" * 55)
     logger.info("DIAGNOSTICS COMPLETE")
