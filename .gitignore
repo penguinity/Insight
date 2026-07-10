@@ -12,10 +12,10 @@ __pycache__/
 quick test.py
 quick_test.py
 ai_reporter.py
-pdf_report.py
 
 # Personal Reference Materials & Folder Drafts
 reference/
+reports/
 
 # Local Big Data Assets (Forbidden from tracking due to file size limits)
 data/cms_source.zip
