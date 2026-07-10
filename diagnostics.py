@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
         help="Explicit path to a SQLite file (overrides default state target).",
     )
     parser.add_argument(
-        "--state NC",
+        "--state",
         type=str,
         metavar="XX",
         help="Two-letter state abbreviation (e.g., AL, NC).",
