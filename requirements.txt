@@ -1,0 +1,4 @@
+fpdf2>=2.8,<3
+pyspark==4.1.2
+python-dotenv>=1.0,<2
+requests>=2.32,<3

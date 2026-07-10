@@ -15,7 +15,10 @@ import argparse
 import importlib
 import json
 import logging
+import os
 import sqlite3
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 from typing import Any, Iterable
@@ -79,9 +82,67 @@ def _require_pyspark() -> tuple[Any, Any]:
         spark_functions = importlib.import_module("pyspark.sql.functions")
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "PySpark is required for this ETL mode. Install with: pip install pyspark"
+            "PySpark is required for this ETL mode. Install project deps with: "
+            "pip install -r requirements.txt"
         ) from exc
     return spark_sql.SparkSession, spark_functions
+
+
+def _is_path_safe_for_windows_batch(path: Path) -> bool:
+    """Return True when a path is unlikely to break Spark batch script parsing."""
+
+    raw = str(path)
+    # Spark's Windows batch launch chain can fail on unquoted paths.
+    return " " not in raw and "&" not in raw
+
+
+def _ensure_windows_spark_home_alias(logger: logging.Logger) -> None:
+    """Ensure SPARK_HOME points to a safe path on Windows.
+
+    PySpark's bundled batch launch scripts can break when installed under paths
+    containing spaces or '&'. This helper creates a junction alias at C:\\sparklink_cms
+    and points SPARK_HOME there to keep Spark startup stable across runs.
+    """
+
+    if os.name != "nt":
+        return
+
+    pyspark_module = importlib.import_module("pyspark")
+    pyspark_module_path = getattr(pyspark_module, "__file__", None)
+    if not pyspark_module_path:
+        raise RuntimeError("Could not resolve installed PySpark package path.")
+    pyspark_home = Path(pyspark_module_path).resolve().parent
+
+    if _is_path_safe_for_windows_batch(pyspark_home):
+        os.environ.setdefault("SPARK_HOME", str(pyspark_home))
+        return
+
+    alias_path = Path("C:/sparklink_cms")
+
+    # Preserve a user-provided safe SPARK_HOME if one is already configured.
+    existing = os.environ.get("SPARK_HOME")
+    if existing and _is_path_safe_for_windows_batch(Path(existing)):
+        return
+
+    if not alias_path.exists():
+        try:
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(alias_path), str(pyspark_home)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            logger.info("Created Spark path alias at %s", alias_path)
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            raise RuntimeError(
+                "Unable to create Spark path alias required on Windows. "
+                f"Command error: {stderr or 'unknown error'}."
+            ) from exc
+
+    os.environ["SPARK_HOME"] = str(alias_path)
+    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+    logger.info("Using SPARK_HOME=%s", os.environ["SPARK_HOME"])
 
 
 def _resolve_column_name(df: Any, candidates: tuple[str, ...]) -> str | None:
@@ -602,6 +663,7 @@ def run_etl(states: tuple[str, ...], use_spark: bool = True, force_download: boo
         logger.info("Reusing existing archive at %s", ZIP_PATH.resolve())
 
     if use_spark:
+        _ensure_windows_spark_home_alias(logger)
         SparkSession, _ = _require_pyspark()
     else:
         raise RuntimeError(

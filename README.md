@@ -34,8 +34,12 @@ reports/                  # Generated PDF audit memos (gitignored)
 ### 1. Install dependencies
 
 ```bash
-pip install requests python-dotenv fpdf2 pyspark
+pip install -r requirements.txt
 ```
+
+Windows note:
+- `etl_pipeline.py` now auto-hardens `SPARK_HOME` to a safe junction path (`C:\\sparklink_cms`) when PySpark is installed under a path with spaces or `&`.
+- This resolves the recurring `[JAVA_GATEWAY_EXITED]` startup failure without manual reconfiguration each run.
 
 ### 2. Configure environment
 

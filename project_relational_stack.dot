@@ -1,0 +1,42 @@
+digraph InsightArchitecture {
+    // Force a top-down, clean hierarchy
+    rankdir=TB;
+    nodesep=0.5;
+    ranksep=0.8;
+    splines=ortho; // Makes lines look like professional circuit diagrams
+
+    node [shape=box, style="rounded,filled", fillcolor="#F8FAFC", fontname="Segoe UI", fontsize=10];
+
+    // --- LEVEL 1: THE HUB ---
+    root [label="CMS Provider Project\n(Workspace Root)", fillcolor="#DBEAFE", penwidth=2];
+
+    // --- LEVEL 2: FUNCTIONAL DOMAINS ---
+    etl_branch [label="ETL Pipeline Domain"];
+    diag_branch [label="Diagnostic Domain"];
+    sql_branch [label="SQL / Data Domain"];
+
+    root -> {etl_branch diag_branch sql_branch};
+
+    // --- LEVEL 3: CORE SCRIPTS ---
+    etl_pipeline [label="etl_pipeline.py"];
+    ai_reporter [label="ai_reporter.py"];
+    pdf_report [label="pdf_report.py"];
+    diagnostics [label="diagnostics.py"];
+    schema_router [label="schema_router.py"];
+
+    etl_branch -> {etl_pipeline ai_reporter pdf_report};
+    diag_branch -> {diagnostics};
+    sql_branch -> {schema_router};
+
+    // --- LEVEL 4: ASSETS & INFRASTRUCTURE ---
+    ddl [label="queries/ddl_schema.sql", shape=note];
+    db [label="cms_outliers.db", shape=cylinder, fillcolor="#FEF2F2"];
+    
+    schema_router -> ddl;
+    etl_pipeline -> db;
+    diagnostics -> db;
+
+    // --- FORCING THE TREE STRUCTURE ---
+    { rank=same; etl_branch; diag_branch; sql_branch; }
+    { rank=same; etl_pipeline; diagnostics; schema_router; }
+}
